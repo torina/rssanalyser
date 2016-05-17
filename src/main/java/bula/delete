@@ -1,0 +1,262 @@
+package com.company;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.LinkedList;
+
+/**
+ * A key data structure required for an FP-Stream implementation is a tilted time window. One can opt
+ * for either a natural tilted time window model or a logarithmic tilted time window.
+ * In the context of my thesis, a natural tilted time window model makes more sense,
+ * since it allows you to mine frequent itemsets over the last week, the last month, and so on,
+ * whereas a logarithmic tilted time window model would only allow for the last hour,
+ * the last 2 hours, the last 4, 8, 16, 32 hours, and so on. These windows are clearly harder to interpret the results
+ * for in the context of WPO analytics than a natural tilted time window.
+ I opted for a natural tilted time window with a precision of a quarter of an hour that would keep the data of up to 1 year ago.
+ Given granularities of a quarter, an hour, a day, a month and a year
+ (thus, there is a “quarter” (that’s 15 minutes for American readers) granularity, an “hour” granularity, and so on),
+ that results in a grand total of 4 + 24 + 31 + 12 + 1 = 72 units of time. For each such unit,
+ there is a bucket in the TiltedTimeWindow. That is, there are 4 quarter buckets, 24 hour buckets, 31 day buckets,
+ 12 month buckets and 1 year bucket. The first quarter bucket corresponds to the last quarter,
+ the second quarter bucket corresponds to the last but one quarter (i.e. the quarter a quarter ago), and so on.
+ The FP-Stream paper also describes how to prune data that will no longer be needed for the resulting frequent itemsets
+ to be sufficiently accurate. This continuously (with every new batch of transactions that arrives)
+ ensures that stale data is deleted from memory, and thus keeping memory consumption low.
+ */
+public class TiltedTimeWindow {
+
+    public enum Granularity {
+        GRANULARITY_QUARTER,
+        GRANULARITY_HOUR,
+        GRANULARITY_DAY,
+        GRANULARITY_MONTH,
+        GRANULARITY_YEAR;
+
+        private static Granularity[] vals = values();
+        public Granularity prev()
+        {
+            return vals[(this.ordinal()-1) % vals.length];
+        }
+
+        public Granularity next()
+        {
+            return vals[(this.ordinal()+1) % vals.length];
+        }
+    }
+
+
+    public static int TTW_NUM_GRANULARITIES = 5;
+    public static int  TTW_NUM_BUCKETS  = 72;
+    static int TTW_BUCKET_UNUSED =  -1;
+
+    static Integer [] GranularityBucketCount = {4, 24, 31, 12,  1};
+    static Integer [] GranularityBucketOffset = {0,  4, 28, 59, 71};
+    static char [] GranularityChar = {'Q','H','D','M','Y' };
+
+    LinkedList<String> someVector;
+
+    public TiltedTimeWindow() {
+        this.oldestBucketFilled = -1;
+        this.lastUpdate = 0;
+        for (int b = 0; b < TTW_NUM_BUCKETS; b++)
+            this.buckets[b] = TTW_BUCKET_UNUSED;
+        for (int g = 0; g < TTW_NUM_GRANULARITIES; g++)
+            this.capacityUsed[g] = 0;
+    }
+    public void appendQuarter(Integer supportCount, int updateID) {
+        System.out.println("appending count amount: "+ supportCount + ", numberOfUpdate: "+ updateID);
+        this.lastUpdate = updateID;
+        store(Granularity.GRANULARITY_QUARTER, supportCount);
+    }
+    boolean isEmpty()  { return this.oldestBucketFilled == -1; }
+    public int getLastUpdate() { return this.lastUpdate; }
+    /**
+     * Drop the tail. Only allow entire granularities to be dropped. Otherwise
+     * tail dropping/pruning may result in out-of-sync TiltedTimeWindows. This
+     * of course leads to TiltedTimeWindows tipping over to the higher-level
+     * granularities at different points in time, which would cause incorrect
+     * results.
+     *
+     * @param start
+     *   The granularity starting from which all buckets should be dropped.
+     */
+    public void dropTail(Granularity start) {
+        Granularity g;
+        for (g = Granularity.values()[TTW_NUM_GRANULARITIES - 1]; g.compareTo(start) >= 1; g = g.prev())
+            this.reset(g);
+    }
+    int getOldestBucketFilled() { return this.oldestBucketFilled; }
+    int getCapacityUsed(Granularity g)  { return this.capacityUsed[g.ordinal()]; }
+    /**
+     * Get the support in this TiltedTimeWindow for a range of buckets.
+     *
+     * @param from
+     *   The range starts at this bucket.
+     * @param to
+     *   The range ends at this bucket.
+     * @return
+     *   The total support in the buckets in the given range.
+     */
+    Integer getSupportForRange(int from, int to) {
+        // Return 0 if this TiltedTimeWindow is empty.
+        if (this.oldestBucketFilled == -1)
+        return 0;
+
+        // Otherwise, count the sum.
+        Integer sum = 0;
+        for (int i = from; i <= to && i <= (Integer) this.oldestBucketFilled; i++) {
+            if (this.buckets[i] != (Integer) TTW_BUCKET_UNUSED)
+            sum += this.buckets[i];
+        }
+
+        return sum;
+    }
+
+    // Unit testing helper method.
+    public LinkedList<Integer> getBuckets(int numBuckets) {
+//        Q_ASSERT(numBuckets <= TTW_NUM_BUCKETS);
+
+        LinkedList<Integer> v = new LinkedList<>();
+        for (int i = 0; i < numBuckets; i++)
+            v.add(this.buckets[i]);
+        return v;
+    }
+
+    public LinkedList<Integer> getBuckets() {
+        LinkedList<Integer> v = new LinkedList<>();
+        for (int i = 0; i <TTW_NUM_BUCKETS; i++)
+            v.add(this.buckets[i]);
+        return v;
+    }
+    // Properties.
+    Integer [] buckets = new Integer[TTW_NUM_BUCKETS]; //SupportCount
+    int oldestBucketFilled;
+
+    // Static methods.
+    static int quarterDistanceToBucket(int bucket, boolean includeBucketItself){
+        int quarters = 0;
+
+        Granularity g = Granularity.GRANULARITY_HOUR;//(Granularity) 1 ;
+        int nextOffset = GranularityBucketOffset[g.ordinal()];
+        int quartersIncrement = 1;
+        for (int i = 0; i < bucket || (includeBucketItself && i == bucket); i++) {
+            // Ensure we're working with the right quarters increment.
+            while (i >= nextOffset) {
+                quartersIncrement *= GranularityBucketCount [g.prev().ordinal()];//[(Granularity) (g - 1)];
+                g = g.next(); //(Granularity) (g + 1);
+                nextOffset = GranularityBucketOffset[g.ordinal()];
+            }
+
+            quarters += quartersIncrement;
+        }
+
+        return quarters;
+    }
+
+    // Static properties
+//    static uint GranularityBucketCount[TTW_NUM_GRANULARITIES];
+//    static uint GranularityBucketOffset[TTW_NUM_GRANULARITIES];
+//    static char GranularityChar[TTW_NUM_GRANULARITIES];
+
+
+    // Methods.
+    protected void reset(Granularity granularity) {
+        int offset = GranularityBucketOffset[granularity.ordinal()];
+        int count = GranularityBucketCount[granularity.ordinal()];
+
+        // Reset this granularity's buckets.
+//      memset(this.buckets + offset, TTW_BUCKET_UNUSED, count * sizeof(int));
+//      void * memset (void * ptr, int value, size_t num);
+        Arrays.fill(this.buckets, offset, offset+count, TTW_BUCKET_UNUSED);
+
+        // Update this granularity's used capacity..
+        this.capacityUsed[granularity.ordinal()] = 0;
+
+        // Update oldestBucketFilled by resetting it to the beginning of this
+        // granularity, but only if it is in fact currently pointing to a
+        // position *within* this granularity (i.e. if it is in the range
+        // [offset, offset + count - 1]).
+        if (this.oldestBucketFilled > offset - 1 && this.oldestBucketFilled < offset + count) {
+            this.oldestBucketFilled = offset - 1;
+        }
+    }
+    /**
+     * Shift the support counts from one granularity to the next.
+     *
+     * @param granularity
+     *   The granularity that should be shifted.
+     */
+    protected void shift(Granularity granularity) {
+        // If the next granularity does not exist, reset this granularity.
+        if (granularity.ordinal() + 1 > TTW_NUM_GRANULARITIES - 1)
+            this.reset(granularity);
+
+        int offset = GranularityBucketOffset[granularity.ordinal()];
+        int count  = GranularityBucketCount[granularity.ordinal()];
+
+        // Calculate the sum of this granularity's buckets.
+        Integer sum = 0; //SupportCount
+        for (int bucket = 0; bucket < count; bucket++)
+            sum += buckets[offset + bucket];
+
+        // Reset this granularity.
+        this.reset(granularity);
+
+        // Store the sum of the buckets in the next granularity.
+        this.store((Granularity) (granularity.next()), sum);
+    }
+    /**
+     * Store a next support count in a granularity.
+     *
+     * @param granularity
+     *   The granularity to which this support count should be appended.
+     * @param supportCount
+     *   The supportCount that should be appended.
+     */
+    protected void store(Granularity granularity, Integer supportCount){
+        System.out.println("buckets AT START: " + getBuckets(4));
+        int offset  = GranularityBucketOffset[granularity.ordinal()];
+        int count   = GranularityBucketCount[granularity.ordinal()];
+        System.out.print("offset: "+ offset);
+        System.out.println(", count: "+ count);
+        int capacityUsed = this.capacityUsed[granularity.ordinal()];
+
+        // If the current granularity's maximum capacity has been reached,
+        // then shift it to the next (less granular) granularity.
+        if (capacityUsed == count) {
+            System.out.println("capacity == count!");
+            this.shift(granularity);
+            capacityUsed = this.capacityUsed[granularity.ordinal()];
+        }
+
+        // Store the value (in the first bucket of this granularity, which
+        // means we'll have to move the data in previously filled in buckets
+        // in this granularity) and update this granularity's capacity.
+        if (capacityUsed > 0) {
+            //memmove(buckets + offset + 1, buckets + offset, capacityUsed * sizeof(int));
+            //void * memmove ( void * destination, const void * source, size_t num );
+            Integer[] copied = Arrays.copyOfRange(buckets, offset, offset+ capacityUsed);
+            System.out.println("offset:: " + offset);
+            System.out.println(Arrays.toString(copied));
+            for(int i = 0; i<capacityUsed; i++) {
+                buckets[offset+1+i] = copied[i];
+            }
+        }
+        buckets[offset] = supportCount;
+        System.out.println("capacity used before: " +this.capacityUsed[granularity.ordinal()]);
+        this.capacityUsed[granularity.ordinal()]++;
+        System.out.println("capacity used after: " +this.capacityUsed[granularity.ordinal()]);
+
+        // Update oldestbucketFilled.
+        if (this.oldestBucketFilled < (int) (offset + this.capacityUsed[granularity.ordinal()] - 1))
+        this.oldestBucketFilled = offset + this.capacityUsed[granularity.ordinal()] - 1;
+        System.out.println("buckets IN THE END: " + getBuckets(4)+'\n');
+
+    }
+
+    // Properties.
+    int [] capacityUsed = new int[TTW_NUM_GRANULARITIES];
+    int lastUpdate;
+
+
+}
